@@ -1,0 +1,14 @@
+[package]
+name = "greentty"
+version = "0.1.0"
+authors = ["seikichi"]
+edition = "2018"
+
+[dependencies]
+arrayvec = "0.4"
+glium = "0.24"
+rusttype = { version = "0.7.6", features = ["gpu_cache"] }
+unicode-normalization = "0.1"
+vte = "0.3.3"
+widestring = "0.4.0"
+winapi = { version = "0.3.7", features = ["wincontypes", "consoleapi", "handleapi", "namedpipeapi", "processthreadsapi", "winbase"] }
