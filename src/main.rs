@@ -1,6 +1,6 @@
 mod pty;
 
-use pty::Pty;
+use pty::{Pty, PtyConfig};
 
 use glium::glutin::{ContextBuilder, EventsLoop, WindowBuilder};
 use glium::*;
@@ -8,8 +8,6 @@ use vte::{Parser, Perform};
 
 use std::borrow::Cow;
 use std::error::Error;
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,7 +85,9 @@ impl Grid {
             .map(|line| line.iter().collect::<String>())
             .collect::<Vec<String>>()
     }
+}
 
+impl Perform for Grid {
     fn print(&mut self, c: char) {
         while self.cursor.y >= self.lines.len() {
             self.lines.push(vec![]);
@@ -137,59 +137,26 @@ impl Grid {
             _ => {}
         }
     }
-}
 
-struct Handler {
-    grid: Arc<Mutex<Grid>>,
-}
-
-impl Perform for Handler {
-    fn print(&mut self, c: char) {
-        // println!("print: {:?}", c);
-        let mut grid = self.grid.lock().unwrap();
-        grid.print(c);
-    }
-    fn execute(&mut self, byte: u8) {
-        // println!("execute: {}", byte);
-        let mut grid = self.grid.lock().unwrap();
-        grid.execute(byte);
-    }
     fn hook(&mut self, _params: &[i64], _intermediates: &[u8], _ignore: bool) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
     fn osc_dispatch(&mut self, _params: &[&[u8]]) {}
-    fn csi_dispatch(&mut self, params: &[i64], intermediates: &[u8], ignore: bool, c: char) {
-        // println!(
-        //     "csi_dispatch: {:?}, {:?}, {:?}, {:?}",
-        //     params, intermediates, ignore, c
-        // );
-        let mut grid = self.grid.lock().unwrap();
-        grid.csi_dispatch(params, intermediates, ignore, c);
-    }
     fn esc_dispatch(&mut self, _params: &[i64], _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 }
 
 fn main() -> Result<(), Box<Error>> {
-    let (_pty, mut reader, mut writer) = Pty::spawn("powershell")?;
-    let grid = Arc::new(Mutex::new(Grid::new()));
-    let cloned_grid = grid.clone();
-
-    thread::spawn(move || {
-        let mut handler = Handler { grid: cloned_grid };
-        let mut parser = Parser::new();
-        let mut buffer = [0; 32];
-        loop {
-            let n = reader.read(&mut buffer).unwrap();
-            // println!("n = {}", n);
-            for b in &buffer[..n] {
-                parser.advance(&mut handler, *b);
-            }
-        }
-    });
+    let config = PtyConfig {
+        shell: "powershell",
+        ..Default::default()
+    };
+    let pty = Pty::spawn(&config)?;
+    let mut grid = Grid::new();
+    let mut parser = Parser::new();
 
     use std::fs;
     use std::sync::Arc;
-    let font_data = fs::read("fonts/FiraCode-Regular.ttf")?;
+    let font_data = fs::read("fonts/RictyDiminishedDiscord-with-FiraCode-Regular.ttf")?;
     let bytes: Arc<[u8]> = font_data.clone().into();
     let hb_font = harfbuzz_rs::rusttype::create_harfbuzz_rusttype_font(bytes, 0)?;
     let font = Font::from_bytes(&font_data)?;
@@ -251,6 +218,14 @@ fn main() -> Result<(), Box<Error>> {
     let mut accumulator = Duration::new(0, 0);
     let mut previous_clock = Instant::now();
     loop {
+        loop {
+            if let Ok(b) = pty.try_receive() {
+                parser.advance(&mut grid, b);
+            } else {
+                break;
+            }
+        }
+
         let dpi_factor = display.gl_window().get_hidpi_factor();
         let (width, _): (u32, _) = display
             .gl_window()
@@ -281,7 +256,11 @@ fn main() -> Result<(), Box<Error>> {
                         _ => (),
                     },
                     WindowEvent::ReceivedCharacter(c) => {
-                        writer.write(&[c as u8]).unwrap();
+                        let mut bytes = [0; 4];
+                        let s = c.encode_utf8(&mut bytes);
+                        for b in s.bytes() {
+                            pty.send(b).unwrap();
+                        }
                     }
                     _ => {}
                 }
@@ -291,7 +270,7 @@ fn main() -> Result<(), Box<Error>> {
             break;
         }
 
-        let lines = grid.lock().unwrap().lines();
+        let lines = grid.lines();
         let glyphs = layout_paragraph(
             &font,
             &hb_font,
