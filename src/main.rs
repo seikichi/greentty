@@ -13,47 +13,53 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use harfbuzz_rs::{shape, Font as FBFont, UnicodeBuffer};
 use rusttype::gpu_cache::Cache;
-use rusttype::{point, vector, Font, PositionedGlyph, Rect, Scale};
+use rusttype::{point, vector, Font, GlyphId, PositionedGlyph, Rect, Scale};
 
-fn layout_paragraph<'a>(
+fn layout_paragraph<'a, 'b>(
     font: &'a Font,
+    hb_font: &'a FBFont,
     scale: Scale,
     width: u32,
-    text: &str,
+    lines: &'b Vec<String>,
 ) -> Vec<PositionedGlyph<'a>> {
-    use unicode_normalization::UnicodeNormalization;
+    // use unicode_normalization::UnicodeNormalization;
     let mut result = Vec::new();
     let v_metrics = font.v_metrics(scale);
     let advance_height = v_metrics.ascent - v_metrics.descent + v_metrics.line_gap;
     let mut caret = point(0.0, v_metrics.ascent);
     let mut last_glyph_id = None;
-    for c in text.nfc() {
-        if c.is_control() {
-            match c {
-                '\n' => {
+
+    for line in &lines[..] {
+        let buffer = UnicodeBuffer::new().add_str(line);
+        let output = shape(&hb_font, buffer, &[]);
+
+        let positions = output.get_glyph_positions();
+        let infos = output.get_glyph_infos();
+
+        for (_position, info) in positions.iter().zip(infos) {
+            let base_glyph = font.glyph(GlyphId(info.codepoint));
+
+            if let Some(id) = last_glyph_id.take() {
+                caret.x += font.pair_kerning(scale, id, base_glyph.id());
+            }
+            last_glyph_id = Some(base_glyph.id());
+            let mut glyph = base_glyph.scaled(scale).positioned(caret);
+            if let Some(bb) = glyph.pixel_bounding_box() {
+                if bb.max.x > width as i32 {
                     caret = point(0.0, caret.y + advance_height);
+                    glyph.set_position(caret);
+                    last_glyph_id = None;
                 }
-                _ => {}
             }
-            continue;
+            caret.x += glyph.unpositioned().h_metrics().advance_width;
+            result.push(glyph);
         }
-        let base_glyph = font.glyph(c);
-        if let Some(id) = last_glyph_id.take() {
-            caret.x += font.pair_kerning(scale, id, base_glyph.id());
-        }
-        last_glyph_id = Some(base_glyph.id());
-        let mut glyph = base_glyph.scaled(scale).positioned(caret);
-        if let Some(bb) = glyph.pixel_bounding_box() {
-            if bb.max.x > width as i32 {
-                caret = point(0.0, caret.y + advance_height);
-                glyph.set_position(caret);
-                last_glyph_id = None;
-            }
-        }
-        caret.x += glyph.unpositioned().h_metrics().advance_width;
-        result.push(glyph);
+
+        caret = point(0.0, caret.y + advance_height);
     }
+
     result
 }
 
@@ -75,12 +81,11 @@ impl Grid {
         }
     }
 
-    fn text(&self) -> String {
+    fn lines(&self) -> Vec<String> {
         self.lines
             .iter()
             .map(|line| line.iter().collect::<String>())
             .collect::<Vec<String>>()
-            .join("\n")
     }
 
     fn print(&mut self, c: char) {
@@ -182,8 +187,12 @@ fn main() -> Result<(), Box<Error>> {
         }
     });
 
-    let font_data = include_bytes!("../fonts/migmix-1m-regular.ttf");
-    let font = Font::from_bytes(font_data as &[u8])?;
+    use std::fs;
+    use std::sync::Arc;
+    let font_data = fs::read("fonts/FiraCode-Regular.ttf")?;
+    let bytes: Arc<[u8]> = font_data.clone().into();
+    let hb_font = harfbuzz_rs::rusttype::create_harfbuzz_rusttype_font(bytes, 0)?;
+    let font = Font::from_bytes(&font_data)?;
 
     let window = WindowBuilder::new()
         .with_dimensions((1024, 512).into())
@@ -272,9 +281,7 @@ fn main() -> Result<(), Box<Error>> {
                         _ => (),
                     },
                     WindowEvent::ReceivedCharacter(c) => {
-                        if c != '\u{7f}' && c != '\u{8}' {
-                            writer.write(&[c as u8]).unwrap();
-                        }
+                        writer.write(&[c as u8]).unwrap();
                     }
                     _ => {}
                 }
@@ -284,8 +291,14 @@ fn main() -> Result<(), Box<Error>> {
             break;
         }
 
-        let text = grid.lock().unwrap().text();
-        let glyphs = layout_paragraph(&font, Scale::uniform(24.0 * dpi_factor), width, &text);
+        let lines = grid.lock().unwrap().lines();
+        let glyphs = layout_paragraph(
+            &font,
+            &hb_font,
+            Scale::uniform(24.0 * dpi_factor),
+            width,
+            &lines,
+        );
         for glyph in &glyphs {
             cache.queue_glyph(0, glyph.clone());
         }
@@ -319,7 +332,7 @@ fn main() -> Result<(), Box<Error>> {
             }
 
             implement_vertex!(Vertex, position, tex_coords, colour);
-            let colour = [0.0, 0.0, 0.0, 1.0];
+            let colour = [1.0, 1.0, 1.0, 1.0];
             let (screen_width, screen_height) = {
                 let (w, h) = display.get_framebuffer_dimensions();
                 (w as f32, h as f32)
@@ -383,7 +396,7 @@ fn main() -> Result<(), Box<Error>> {
         };
 
         let mut target = display.draw();
-        target.clear_color(1.0, 1.0, 1.0, 0.0);
+        target.clear_color(0.0, 0.0, 0.0, 0.0);
         target.draw(
             &vertex_buffer,
             glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList),

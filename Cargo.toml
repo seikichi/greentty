@@ -12,3 +12,4 @@ unicode-normalization = "0.1"
 vte = "0.3.3"
 widestring = "0.4.0"
 winapi = { version = "0.3.7", features = ["wincontypes", "consoleapi", "handleapi", "namedpipeapi", "processthreadsapi", "winbase"] }
+harfbuzz_rs = { version = "1.0.0", features = ["rusttype"] }
