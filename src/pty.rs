@@ -1,9 +1,10 @@
+use std::error::Error;
 use std::fs::File;
-use std::io::{Read, Result, Write};
+use std::io::{Read, Write};
 use std::mem;
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::ptr::{null, null_mut};
-use std::sync::mpsc::{channel, Receiver, SendError, Sender, TryRecvError};
+use std::sync::mpsc::{channel, RecvError, Sender};
 use std::thread;
 
 use widestring::U16CString;
@@ -11,6 +12,7 @@ use winapi::shared::basetsd::{PSIZE_T, SIZE_T};
 use winapi::shared::minwindef::BYTE;
 use winapi::shared::ntdef::LPWSTR;
 use winapi::um::consoleapi::{ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole};
+use winapi::um::handleapi::CloseHandle;
 use winapi::um::namedpipeapi::CreatePipe;
 use winapi::um::processthreadsapi::{
     CreateProcessW, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
@@ -20,20 +22,47 @@ use winapi::um::winbase::{EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
 use winapi::um::wincontypes::{COORD, HPCON};
 use winapi::um::winnt::HANDLE;
 
+use vte::Parser;
+pub use vte::Perform as Handler;
+
+#[derive(Clone, Debug)]
 pub struct Pty {
-    handle: HPCON,
-    send: Sender<u8>,
-    recv: Receiver<u8>,
+    tx: Sender<Action>,
 }
 
-pub struct PtyConfig<'a> {
+#[derive(Clone, Debug, PartialEq)]
+enum Action {
+    Resize(i16, i16),
+    Write(u8),
+}
+
+struct PtyInner {
+    handle: HPCON,
+    pipe_in: HANDLE,
+    pipe_out: HANDLE,
+}
+
+// TODO: is it correct?
+unsafe impl Send for PtyInner {}
+
+impl Drop for PtyInner {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.pipe_in);
+            CloseHandle(self.pipe_out);
+            ClosePseudoConsole(self.handle);
+        }
+    }
+}
+
+pub struct Config<'a> {
     pub shell: &'a str,
     pub cols: u32,
     pub rows: u32,
     pub cwd: &'a str,
 }
 
-impl<'a> Default for PtyConfig<'a> {
+impl<'a> Default for Config<'a> {
     fn default() -> Self {
         Self {
             shell: "powershell",
@@ -44,32 +73,23 @@ impl<'a> Default for PtyConfig<'a> {
     }
 }
 
-impl Drop for Pty {
-    fn drop(&mut self) {
-        unsafe {
-            ClosePseudoConsole(self.handle);
-        }
-    }
-}
-
 impl Pty {
-    pub fn send(&self, byte: u8) -> std::result::Result<(), SendError<u8>> {
-        self.send.send(byte)
+    pub fn resize(&self, cols: u32, rows: u32) -> Result<(), Box<Error>> {
+        self.tx.send(Action::Resize(cols as i16, rows as i16))?;
+        Ok(())
     }
 
-    pub fn try_receive(&self) -> std::result::Result<u8, TryRecvError> {
-        self.recv.try_recv()
+    pub fn write(&self, b: u8) -> Result<(), Box<Error>> {
+        self.tx.send(Action::Write(b))?;
+        Ok(())
     }
 
-    pub fn resize(&self, cols: u32, rows: u32) {
-        let y = cols as i16;
-        let x = rows as i16;
-        unsafe {
-            ResizePseudoConsole(self.handle, COORD { X: x, Y: y });
-        }
-    }
+    pub fn spawn<H: Handler + Send + 'static>(
+        config: &Config,
+        mut handler: H,
+    ) -> Result<Self, Box<Error>> {
+        let (tx, rx) = channel::<Action>();
 
-    pub fn spawn(config: &PtyConfig) -> Result<Self> {
         let mut pipe_in: HANDLE = null_mut();
         let mut pipe_out: HANDLE = null_mut();
         let mut pipe_pty_in: HANDLE = null_mut();
@@ -91,6 +111,7 @@ impl Pty {
                 &mut handle,
             );
 
+            // TODO(seikichi): modify drop to delete STARTUPINFOEXW and lpAttributeList
             let mut si_ex: STARTUPINFOEXW = { mem::zeroed() };
             si_ex.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
 
@@ -129,27 +150,43 @@ impl Pty {
             let mut file_in = File::from_raw_handle(pipe_in as RawHandle);
             let mut file_out = File::from_raw_handle(pipe_out as RawHandle);
 
-            let (send_in, recv_in) = channel();
-            let (send_out, recv_out) = channel();
+            let mut parser = Parser::new();
 
             thread::spawn(move || loop {
-                let mut buffer = [0; 32];
-                let n = file_out.read(&mut buffer).unwrap();
-                for b in &buffer[..n] {
-                    send_out.send(*b).unwrap();
+                let mut buffer = [0u8; 1024];
+                match file_out.read(&mut buffer) {
+                    Ok(n) if n > 0 => {
+                        for b in &buffer[..n] {
+                            parser.advance(&mut handler, *b);
+                        }
+                    }
+                    _ => {
+                        break;
+                    }
                 }
             });
 
+            let inner = PtyInner {
+                handle,
+                pipe_in: pipe_pty_in,
+                pipe_out: pipe_pty_out,
+            };
+
             thread::spawn(move || loop {
-                let b = recv_in.recv().unwrap();
-                file_in.write(&[b]).unwrap();
+                match rx.recv() {
+                    Ok(Action::Write(b)) => {
+                        file_in.write(&[b]).unwrap();
+                    }
+                    Ok(Action::Resize(x, y)) => {
+                        ResizePseudoConsole(inner.handle, COORD { X: x, Y: y });
+                    }
+                    Err(RecvError) => {
+                        break;
+                    }
+                }
             });
 
-            Ok(Pty {
-                handle,
-                recv: recv_out,
-                send: send_in,
-            })
+            Ok(Pty { tx })
         }
     }
 }
